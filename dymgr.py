@@ -1,9 +1,14 @@
-import json, time, datetime, difflib, httpx, re, io, base64
+import json, time, datetime, difflib, httpx, re, io, base64, traceback
 import asyncio
 import configparser as cfg
 import os
+import html as html_module
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from urllib.parse import urljoin
+from xml.etree import ElementTree
 from os.path import dirname, join, exists, getmtime
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from .res import drawCard
 from .res import wbi
 from .res import auth
@@ -50,6 +55,210 @@ p = {
 WEB_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
 DYNAMIC_FEATURES = "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,endFooterHidden,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete,commentsNewVersion"
 
+RSSHUB_ENABLED = os.getenv("BILINOTICE_RSSHUB_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+RSSHUB_BASE_URL = os.getenv("BILINOTICE_RSSHUB_URL", "http://127.0.0.1:1200").rstrip("/")
+RSSHUB_TIMEOUT = float(os.getenv("BILINOTICE_RSSHUB_TIMEOUT", "20"))
+
+
+class RSSMediaParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text_parts = []
+        self.media_urls = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+        if tag in ("img", "video", "source"):
+            url = attrs.get("src") or attrs.get("poster")
+            if url:
+                self.media_urls.append(url)
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if not self._skip_depth and data.strip():
+            self.text_parts.append(data.strip())
+
+
+def xml_local_name(tag):
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def xml_child(element, name):
+    for child in list(element):
+        if xml_local_name(child.tag) == name.lower():
+            return child
+    return None
+
+
+def xml_child_text(element, names):
+    if isinstance(names, str):
+        names = (names,)
+    for name in names:
+        child = xml_child(element, name)
+        if child is not None:
+            value = "".join(child.itertext()).strip()
+            if value:
+                return value
+    return ""
+
+
+def clean_rss_html(value):
+    parser = RSSMediaParser()
+    try:
+        parser.feed(html_module.unescape(value or ""))
+    except Exception:
+        pass
+    text = re.sub(r"\\s+", " ", " ".join(parser.text_parts)).strip()
+    return text, parser.media_urls
+
+
+def parse_rss_date(value):
+    if not value:
+        return int(time.time())
+    try:
+        return int(parsedate_to_datetime(value).timestamp())
+    except Exception:
+        return int(time.time())
+
+
+def parse_rss_feed(content, base_url):
+    root = ElementTree.fromstring(content)
+    entries = []
+    root_name = xml_local_name(root.tag)
+    if root_name == "rss":
+        channel = xml_child(root, "channel") or root
+        nodes = [node for node in list(channel) if xml_local_name(node.tag) == "item"]
+    elif root_name == "feed":
+        nodes = [node for node in list(root) if xml_local_name(node.tag) == "entry"]
+    else:
+        nodes = []
+
+    for node in nodes:
+        guid = xml_child_text(node, ("guid", "id"))
+        title = xml_child_text(node, "title")
+        description = xml_child_text(node, ("encoded", "content", "description", "summary"))
+        link_node = xml_child(node, "link")
+        link = ""
+        if link_node is not None:
+            link = link_node.attrib.get("href", "") or (link_node.text or "").strip()
+        link = urljoin(base_url + "/", link)
+        pub_date = xml_child_text(node, ("pubDate", "published", "updated"))
+
+        media_urls = []
+        for child in node.iter():
+            name = xml_local_name(child.tag)
+            if name in ("content", "enclosure", "thumbnail"):
+                url = child.attrib.get("url") or child.attrib.get("href")
+                if url:
+                    media_urls.append(urljoin(base_url + "/", url))
+
+        text, html_media = clean_rss_html(description)
+        media_urls.extend(urljoin(base_url + "/", url) for url in html_media)
+        unique_media = []
+        for url in media_urls:
+            if url and url not in unique_media:
+                unique_media.append(url)
+
+        entries.append({
+            "id": guid or link or title,
+            "title": re.sub(r"\\s+", " ", title or "").strip(),
+            "description": text,
+            "link": link,
+            "pub_time": parse_rss_date(pub_date),
+            "media": unique_media,
+        })
+    return entries
+
+
+async def fetch_rsshub_entries(uid_str):
+    if not RSSHUB_ENABLED:
+        return None
+    url = f"{RSSHUB_BASE_URL}/bilibili/user/dynamic/{uid_str}"
+    try:
+        async with async_client() as client:
+            response = await client.get(url, timeout=RSSHUB_TIMEOUT, follow_redirects=True)
+        if response.status_code != 200:
+            log.warning(f'RSSHub请求失败：uid={uid_str}, HTTP={response.status_code}, body={response.text[:200]}')
+            return None
+        entries = parse_rss_feed(response.content, RSSHUB_BASE_URL)
+        log.debug(f'RSSHub读取成功：uid={uid_str}, entries={len(entries)}')
+        return entries
+    except Exception as e:
+        log.warning(f'RSSHub请求异常：uid={uid_str}, error={e}')
+        return None
+
+
+def rss_entry_title(entry, fallback_nick):
+    title = (entry.get("title") or "").strip()
+    description = (entry.get("description") or "").strip()
+    if not title or title == f"{fallback_nick}的动态" or title.endswith("的动态"):
+        excerpt = re.sub(r"\\s+", " ", description).strip()
+        if excerpt:
+            return excerpt[:50] + ("..." if len(excerpt) > 50 else "")
+    return title or description[:50] or "发布了一条动态"
+
+
+async def rss_entry_to_info(entry, this_up):
+    nick = this_up.get("uname", "未知UP")
+    title = rss_entry_title(entry, nick)
+    media = []
+    for url in entry.get("media", []):
+        try:
+            image = await get_Image(Type="image", url=url)
+            if image is not None:
+                media.append(image)
+        except Exception as e:
+            log.warning(f'RSS媒体下载失败：{url}, error={e}')
+
+    stat = {}
+    img = draw_simple_web_card(media[:9], title, nick, entry.get("pub_time", int(time.time())), stat)
+    return {
+        "nickname": nick,
+        "uid": int(entry.get("id", "0")) if str(entry.get("id", "0")).isdigit() else 0,
+        "type": "视频" if entry.get("title") and not entry.get("description") and media else ("图文动态" if media else "动态"),
+        "subtype": "RSSHub",
+        "time": entry.get("pub_time", int(time.time())),
+        "pic": image_to_base64(img),
+        "link": entry.get("link") or "",
+        "sublink": "",
+        "group": this_up["group"]
+    }
+
+
+async def get_rsshub_update(uid_str, this_up, history_ids):
+    entries = await fetch_rsshub_entries(uid_str)
+    if entries is None:
+        return None, 0
+    result = []
+    fresh = 0
+    for entry in entries:
+        entry_id = entry.get("id") or entry.get("link")
+        if not entry_id:
+            continue
+        try:
+            numeric_id = int(re.search(r"(\\d{10,})", str(entry_id)).group(1))
+        except Exception:
+            numeric_id = None
+        history_key = numeric_id if numeric_id is not None else str(entry_id)
+        if history_key in history_ids or str(history_key) in {str(x) for x in history_ids}:
+            continue
+        if conf.getint('common','available_time') * 60 < int(time.time()) - int(entry.get("pub_time", time.time())):
+            up_latest[uid_str].append(numeric_id or str(entry_id))
+            continue
+        info = await rss_entry_to_info(entry, this_up)
+        result.append(info)
+        up_latest[uid_str].append(numeric_id or str(entry_id))
+        fresh += 1
+    if result:
+        up_history_write(uid_str)
+    return result, fresh
+
 
 def bili_web_headers(referer="https://www.bilibili.com/"):
     return {
@@ -72,6 +281,116 @@ def image_to_base64(img):
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     return 'base64://' + base64.b64encode(bio.getvalue()).decode()
+
+
+def get_web_video_title(card: dict):
+    dynamic = get_web_module(card, "module_dynamic")
+    if isinstance(dynamic, dict):
+        major = dynamic.get("major") or {}
+        archive = major.get("archive") or {} if isinstance(major, dict) else {}
+        if isinstance(archive, dict) and archive.get("title"):
+            return str(archive["title"]).strip()
+
+    top = get_web_module(card, "module_top")
+    display = top.get("display") if isinstance(top, dict) else {}
+    video = display.get("video") if isinstance(display, dict) else {}
+    if isinstance(video, dict):
+        for key in ("title", "name"):
+            if video.get(key):
+                return str(video[key]).strip()
+    return ""
+
+
+def load_font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def wrap_text(draw, text, font, max_width):
+    lines = []
+    for paragraph in str(text or "").splitlines() or [""]:
+        line = ""
+        for char in paragraph:
+            candidate = line + char
+            if line and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+                lines.append(line)
+                line = char
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+    return lines or [""]
+
+
+def get_stat_count(stat, key):
+    value = stat.get(key) if isinstance(stat, dict) else {}
+    return value.get("count", 0) if isinstance(value, dict) else 0
+
+
+def draw_simple_web_card(imgs, title, nick, pub_time, stat, face=None):
+    width = conf.getint('drawCard', 'width')
+    width = max(480, min(width, 900))
+    margin = 24
+    header_h = 76
+    title_font = load_font(join(res_dir, 'fonts/pinfang.ttf'), 20)
+    nick_font = load_font(join(res_dir, 'fonts/pinfang.ttf'), 18)
+    time_font = load_font(join(res_dir, 'fonts/pinfang.ttf'), 13)
+    body_font = load_font(join(res_dir, 'fonts/pinfang.ttf'), 16)
+    stat_font = load_font(join(res_dir, 'fonts/pinfang.ttf'), 13)
+    probe = Image.new('RGBA', (width, 100), 'white')
+    probe_draw = ImageDraw.Draw(probe)
+    title_lines = wrap_text(probe_draw, title, title_font, width - margin * 2)
+    text_h = len(title_lines) * 27 + 16
+    image_gap = 8
+    image_w = (width - margin * 2 - image_gap) // 2
+    image_rows = []
+    for index in range(0, len(imgs), 2):
+        row = imgs[index:index + 2]
+        row_images = []
+        row_h = 0
+        for source in row:
+            ratio = source.width / max(source.height, 1)
+            height = min(360, max(120, int(image_w / max(ratio, 0.2))))
+            copy = source.copy().convert('RGB')
+            copy.thumbnail((image_w, height), Image.Resampling.LANCZOS)
+            row_images.append(copy)
+            row_h = max(row_h, copy.height)
+        image_rows.append((row_images, row_h))
+
+    image_h = sum(row_h + image_gap for _, row_h in image_rows)
+    footer_h = 48
+    height = header_h + text_h + image_h + footer_h + margin
+    canvas = Image.new('RGB', (width, height), 'white')
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=10, outline=(225, 225, 225), fill='white')
+
+    if face is not None:
+        avatar = face.convert('RGB').resize((48, 48), Image.Resampling.LANCZOS)
+        canvas.paste(avatar, (margin, 16))
+    text_x = margin + 64
+    draw.text((text_x, 17), nick, fill=(35, 35, 35), font=nick_font)
+    draw.text((text_x, 45), time.strftime('%y-%m-%d %H:%M', time.localtime(pub_time)), fill=(145, 150, 158), font=time_font)
+
+    y = header_h
+    for line in title_lines:
+        draw.text((margin, y), line, fill=(45, 45, 45), font=title_font)
+        y += 27
+    y += 10
+
+    for row_images, row_h in image_rows:
+        x = margin
+        for source in row_images:
+            canvas.paste(source, (x, y))
+            x += image_w + image_gap
+        y += row_h + image_gap
+
+    y = height - footer_h + 8
+    draw.text((margin, y), f'分享 {get_stat_count(stat, "forward")}', fill=(145, 150, 158), font=stat_font)
+    draw.text((margin + width // 3, y), f'评论 {get_stat_count(stat, "comment")}', fill=(145, 150, 158), font=stat_font)
+    draw.text((margin + width * 2 // 3, y), f'点赞 {get_stat_count(stat, "like")}', fill=(145, 150, 158), font=stat_font)
+    return canvas
 
 
 def rich_text_nodes_to_text(nodes):
@@ -234,19 +553,45 @@ def get_web_dynamic_content(card: dict):
         if isinstance(pic_info, dict):
             image_items.extend(pic_info.get("pics") or [])
 
-    # 新版详情接口有时把 module_content 嵌套在 content/opus 等字段里。
-    if not text_parts and isinstance(content, dict):
-        nested_text = extract_nested_text(content)
-        if nested_text:
-            text_parts.append(nested_text)
-        else:
-            text_parts.extend(collect_web_text(content))
+    # 某些新版响应会把 module_content 再包在 content/opus/detail 中。
+    # 递归找到所有 module_content，避免只依赖一层固定路径。
+    def find_content_modules(value):
+        found = []
+        if isinstance(value, dict):
+            module_content = value.get("module_content")
+            if isinstance(module_content, dict):
+                found.append(module_content)
+            for child in value.values():
+                found.extend(find_content_modules(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(find_content_modules(child))
+        return found
+
+    if not text_parts:
+        for nested_content in find_content_modules(card):
+            nested_text = extract_content_text(nested_content)
+            if not nested_text:
+                nested_text = extract_nested_text(nested_content)
+            if nested_text:
+                text_parts.append(nested_text)
+                break
+        if not text_parts and isinstance(content, dict):
+            nested_text = extract_nested_text(content)
+            if nested_text:
+                text_parts.append(nested_text)
+            else:
+                text_parts.extend(collect_web_text(content))
 
     # 列表接口通常把正文放在 module_dynamic.desc 中。
     dynamic = get_web_module(card, "module_dynamic")
     if isinstance(dynamic, dict):
         desc = dynamic.get("desc") or {}
         desc_text = extract_nested_text(desc)
+        if not desc_text and isinstance(desc, dict):
+            desc_text = rich_text_nodes_to_text(desc.get("text"))
+            if not desc_text:
+                desc_text = rich_text_nodes_to_text(desc.get("rich_text_nodes"))
         if desc_text and not text_parts:
             text_parts.append(desc_text)
         if not text_parts:
@@ -313,7 +658,9 @@ def get_web_dynamic_title(card: dict, nick: str):
             title = excerpt[:50] + ("..." if len(excerpt) > 50 else "")
         elif video_title:
             title = str(video_title).strip()
-    return title or "发布了一条动态"
+    if not title:
+        title = video_title or "发布了一条动态"
+    return title
 
 
 async def draw_web_dynamic_card(card: dict, this_up: dict):
@@ -328,15 +675,14 @@ async def draw_web_dynamic_card(card: dict, this_up: dict):
     if not text and not items:
         return None, ""
 
-    box = drawCard.Box(conf)
-    face_url = author.get("face") if isinstance(author, dict) else ""
-    face = await get_Image(Type="face", url=face_url) if face_url else Image.new('RGBA', (42,42), 'white')
-    faceimg = box.face(face)
     nick = (author.get("name") if isinstance(author, dict) else "") or this_up.get("uname", "未知UP")
     pub_time, _ = get_card_pub_time(card)
-    nickimg = box.nickname(nick=nick, time=time.strftime("%y-%m-%d %H:%M", time.localtime(pub_time)))
-
     title = get_web_dynamic_title(card, nick)
+    if not text:
+        video_title = get_web_video_title(card)
+        if video_title:
+            title = video_title
+
     log.debug(f'新版动态文字提取：id={card.get("id_str")}, title={title[:100]!r}, text={text[:160]!r}, source_type={card.get("type")}')
     pics = []
     seen_urls = set()
@@ -352,22 +698,26 @@ async def draw_web_dynamic_card(card: dict, this_up: dict):
         except Exception as e:
             log.warning(f'新版动态图片下载失败：{e}')
 
-    log.debug(f'新版动态卡片内容：id={card.get("id_str")}, title_len={len(title)}, text_len={len(text)}, pics={len(pics)}, major_type={major_type}')
-    if pics:
-        bodyimg = box.image(title, None, pics[:9], min(len(pics), 9))
-        dytype = "图文动态"
-    else:
-        bodyimg = box.text(title)
-        dytype = "动态"
-
     stat = get_web_module(card, "module_stat")
     stat = stat if isinstance(stat, dict) else {}
-    bottomimg = box.bottom(
-        (stat.get("forward") or {}).get("count", 0),
-        (stat.get("comment") or {}).get("count", 0),
-        (stat.get("like") or {}).get("count", 0)
+    log.debug(f'新版动态卡片内容：id={card.get("id_str")}, title_len={len(title)}, text_len={len(text)}, pics={len(pics)}, major_type={major_type}')
+
+    face_url = author.get("face") if isinstance(author, dict) else ""
+    try:
+        face = await get_Image(Type="face", url=face_url) if face_url else None
+    except Exception as e:
+        log.warning(f'新版动态头像下载失败：{e}')
+        face = None
+
+    img = draw_simple_web_card(
+        pics[:9],
+        title,
+        nick,
+        pub_time,
+        stat,
+        face=face
     )
-    img = box.combine(face=faceimg, nick=nickimg, body=bodyimg, bottom=bottomimg)
+    dytype = "视频" if get_web_video_title(card) and not pics else ("图文动态" if pics else "动态")
     return image_to_base64(img), dytype
 
 
@@ -461,13 +811,58 @@ def get_card_pub_time(card: dict):
     return int(time.time()), f'no valid pub time, pub_ts={pub_ts_raw}, pub_time={pub_time_text}'
 
 
+def merge_dynamic_cards(list_card: dict, detail_card: dict):
+    if not isinstance(detail_card, dict):
+        return list_card
+    merged = dict(list_card)
+    list_modules = list_card.get("modules", {}) if isinstance(list_card, dict) else {}
+    detail_modules = detail_card.get("modules", {})
+
+    # 列表接口和详情接口的 modules 类型不同：一个可能是字典，一个是数组。
+    # 统一转成数组，避免详情模块覆盖列表模块中的正文/封面字段。
+    if isinstance(list_modules, dict) and isinstance(detail_modules, list):
+        module_list = []
+        for key, value in list_modules.items():
+            if value not in (None, "", [], {}):
+                module_list.append({key: value})
+        module_list.extend(detail_modules)
+        merged["modules"] = module_list
+    elif isinstance(list_modules, list) and isinstance(detail_modules, dict):
+        module_list = list(list_modules)
+        for key, value in detail_modules.items():
+            if value not in (None, "", [], {}):
+                module_list.append({key: value})
+        merged["modules"] = module_list
+    elif isinstance(list_modules, list) and isinstance(detail_modules, list):
+        merged["modules"] = list_modules + detail_modules
+    else:
+        for key, value in detail_card.items():
+            if key == "modules":
+                continue
+            if value not in (None, "", [], {}):
+                if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                    nested = dict(merged[key])
+                    nested.update(value)
+                    merged[key] = nested
+                else:
+                    merged[key] = value
+    return merged
+
+
 async def append_web_fallback(dynamic_list: list, card: dict, this_up: dict, header: dict, cookies) -> bool:
+    # 转发动态会嵌套原动态，字段结构与普通图文/视频不同，先稳定发送链接。
+    if card.get("type") == "DYNAMIC_TYPE_FORWARD":
+        log.info(f'转发动态使用纯链接推送：{card["id_str"]}')
+        dynamic_list.append(fallback_dynamic_info(card, this_up))
+        return True
+
     web_card = await get_web_dynamic_detail(card["id_str"], header, cookies)
-    source_card = web_card or card
+    source_card = merge_dynamic_cards(card, web_card)
     try:
         pic, dytype = await draw_web_dynamic_card(source_card, this_up)
     except Exception as e:
         log.warning(f'新版动态图片卡片生成失败：{e}')
+        log.debug('新版动态图片卡片完整异常：\n' + traceback.format_exc())
         pic, dytype = None, ""
 
     dyinfo = fallback_dynamic_info(source_card, this_up)
@@ -630,8 +1025,8 @@ log.info(f'Load up list success: {len(up_list)}')
 gw_user = {}
 gw_nick = {}
 
-for id in up_group_info:
-    u = up_group_info[id]
+for uid_key in up_group_info:
+    u = up_group_info[uid_key]
     if u.get("nick"):
         gw_user[u["uname"]] = {"uid":u["uid"], "nick":u["nick"]}
         for n in u["nick"]:
@@ -708,6 +1103,21 @@ async def get_update():
         uid_str = up_list[number]
         print(f'Check list of {uid_str}')
         header = bili_web_headers(f'https://space.bilibili.com/{uid_str}/dynamic')
+
+        # RSSHub 是文字、视频标题和媒体的首选来源；失败时才回退到 B 站 API。
+        history_ids = set()
+        for value in up_latest.get(uid_str, []):
+            try:
+                history_ids.add(int(value))
+            except (TypeError, ValueError):
+                history_ids.add(str(value))
+        rss_result, rss_count = await get_rsshub_update(uid_str, this_up, history_ids)
+        if rss_result is not None:
+            dynamic_list.extend(rss_result)
+            suc += rss_count
+            number = 0 if number+1>=len(up_list) else number+1
+            return (suc if suc else 0), dynamic_list
+
         # print(f'[Debug] Start getting ID={uid_str}')
         try:
             dynamic_params = {
@@ -1429,8 +1839,8 @@ def save_uname_nick(uid:str, uname:str, nick:str):
         up_group_info[uid]["nick"] = nick
         return "配置文件保存失败"
     # 更新内存中的配置
-    for id in up_group_info:
-        u = up_group_info[id]
+    for uid_key in up_group_info:
+        u = up_group_info[uid_key]
         if u.get("nick"):
             gw_user[u["uname"]] = {"uid":u["uid"], "nick":u["nick"]}
             for n in u["nick"]:
@@ -1466,8 +1876,8 @@ def del_uname_nick(uid:str, uname:str, nick:str):
                 up_group_info[uid]["nick"] = nick
                 return "配置文件保存失败"
             # 更新内存中的配置
-            for id in up_group_info:
-                u = up_group_info[id]
+            for uid_key in up_group_info:
+                u = up_group_info[uid_key]
                 if u.get("nick"):
                     gw_user[u["uname"]] = {"uid":u["uid"], "nick":u["nick"]}
                     for n in u["nick"]:
