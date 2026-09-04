@@ -117,12 +117,92 @@ def extract_paragraph_text(paragraph):
     return ""
 
 
+def extract_nested_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(extract_nested_text(item) for item in value)
+    if not isinstance(value, dict):
+        return ""
+
+    # 新版正文节点通常是 word.words，也兼容 rich.text 和多层 nodes 包装。
+    word = value.get("word")
+    if isinstance(word, dict) and word.get("words"):
+        return str(word["words"])
+    if isinstance(word, str):
+        return word
+    rich = value.get("rich")
+    if isinstance(rich, dict):
+        text = rich.get("text") or rich.get("orig_text")
+        if text:
+            return str(text)
+
+    for key in ("words", "text", "content", "nodes", "paragraphs"):
+        child = value.get(key)
+        if isinstance(child, str):
+            return child
+        if isinstance(child, (dict, list)):
+            text = extract_nested_text(child)
+            if text:
+                return text
+    return ""
+
+
 def extract_content_text(content):
     if not isinstance(content, dict):
         return ""
     paragraphs = content.get("paragraphs") or []
-    parts = [extract_paragraph_text(p) for p in paragraphs]
+    parts = []
+    for paragraph in paragraphs:
+        text = extract_paragraph_text(paragraph)
+        if text:
+            parts.append(text)
+    if not parts:
+        nested = extract_nested_text(content)
+        if nested:
+            parts.append(nested)
     return "\n".join(text for text in parts if text).strip()
+
+
+def collect_web_text(value, results=None, parent_key=""):
+    if results is None:
+        results = []
+    if isinstance(value, str):
+        text = value.strip()
+        if text and not text.startswith(("http://", "https://", "//")):
+            results.append(text)
+        return results
+    if isinstance(value, list):
+        for item in value:
+            collect_web_text(item, results, parent_key)
+        return results
+    if not isinstance(value, dict):
+        return results
+
+    word = value.get("word")
+    if isinstance(word, dict) and word.get("words"):
+        results.append(str(word["words"]))
+        return results
+    if isinstance(word, str):
+        results.append(word)
+        return results
+    rich = value.get("rich")
+    if isinstance(rich, dict):
+        text = rich.get("text") or rich.get("orig_text")
+        if text:
+            results.append(str(text))
+            return results
+
+    preferred_keys = ("words", "orig_text", "summary", "description", "content", "title", "desc", "text", "nodes", "paragraphs")
+    visited = set()
+    for key in preferred_keys:
+        child = value.get(key)
+        if id(child) in visited:
+            continue
+        visited.add(id(child))
+        if isinstance(child, (str, dict, list)):
+            collect_web_text(child, results, key)
+    return results
 
 
 def get_web_module(card: dict, key: str):
@@ -154,21 +234,23 @@ def get_web_dynamic_content(card: dict):
         if isinstance(pic_info, dict):
             image_items.extend(pic_info.get("pics") or [])
 
-    # 新版详情接口使用 MODULE_TYPE_CONTENT，并把文本/图片拆在段落中。
-    # 列表接口则通常把正文放在 module_dynamic.desc 中。
+    # 新版详情接口有时把 module_content 嵌套在 content/opus 等字段里。
+    if not text_parts and isinstance(content, dict):
+        nested_text = extract_nested_text(content)
+        if nested_text:
+            text_parts.append(nested_text)
+        else:
+            text_parts.extend(collect_web_text(content))
+
+    # 列表接口通常把正文放在 module_dynamic.desc 中。
     dynamic = get_web_module(card, "module_dynamic")
     if isinstance(dynamic, dict):
         desc = dynamic.get("desc") or {}
-        if isinstance(desc, dict):
-            desc_text = desc.get("text") or ""
-            if isinstance(desc_text, list):
-                desc_text = rich_text_nodes_to_text(desc_text)
-            if desc_text and not text_parts:
-                text_parts.append(str(desc_text))
-            if not text_parts:
-                rich_text = rich_text_nodes_to_text(desc.get("rich_text_nodes"))
-                if rich_text:
-                    text_parts.append(rich_text)
+        desc_text = extract_nested_text(desc)
+        if desc_text and not text_parts:
+            text_parts.append(desc_text)
+        if not text_parts:
+            text_parts.extend(collect_web_text(desc))
 
         major = dynamic.get("major") or {}
         draw_info = major.get("draw") or {} if isinstance(major, dict) else {}
@@ -178,12 +260,35 @@ def get_web_dynamic_content(card: dict):
         if isinstance(opus_info, dict):
             image_items.extend(opus_info.get("pics") or [])
 
+    # 视频动态的封面在 major.archive.cover，详情页也可能放在 module_top.display.video/album。
+    if isinstance(dynamic, dict):
+        major = dynamic.get("major") or {}
+        archive = major.get("archive") or {} if isinstance(major, dict) else {}
+        if isinstance(archive, dict):
+            cover = archive.get("cover") or archive.get("pic") or archive.get("thumbnail")
+            if cover:
+                image_items.append({"url": cover})
+
+    top = get_web_module(card, "module_top")
+    display = top.get("display") if isinstance(top, dict) else {}
+    if isinstance(display, dict):
+        video = display.get("video") or {}
+        if isinstance(video, dict):
+            cover = video.get("cover") or video.get("thumbnail")
+            if cover:
+                image_items.append({"url": cover})
+        album = display.get("album") or {}
+        if isinstance(album, dict):
+            image_items.extend(album.get("pics") or [])
+
     # 详情接口的 title 可能只有 basic.title，正文仍然来自 paragraphs。
     if not text_parts:
         basic = card.get("basic") or {}
-        summary = basic.get("summary") or basic.get("description") or ""
-        if summary:
-            text_parts.append(str(summary))
+        if isinstance(basic, dict):
+            summary = basic.get("summary") or basic.get("description") or ""
+            summary_text = extract_nested_text(summary)
+            if summary_text:
+                text_parts.append(summary_text)
 
     return "\n".join(text_parts).strip(), image_items
 
@@ -194,13 +299,20 @@ def get_web_dynamic_title(card: dict, nick: str):
     basic = card.get("basic") or {}
     if not title and isinstance(basic, dict):
         title = basic.get("title", "")
-    title = re.sub(r"\s*-\s*哔哩哔哩(?:\s*-\s*Bilibili)?$", "", str(title or "").strip(), flags=re.IGNORECASE)
+    dynamic = get_web_module(card, "module_dynamic")
+    major = dynamic.get("major") or {} if isinstance(dynamic, dict) else {}
+    archive = major.get("archive") or {} if isinstance(major, dict) else {}
+    video_title = archive.get("title") if isinstance(archive, dict) else ""
 
+    title = re.sub(r"\s*-\s*哔哩哔哩(?:\s*-\s*Bilibili)?$", "", str(title or "").strip(), flags=re.IGNORECASE)
     text, _ = get_web_dynamic_content(card)
     title = str(title or "").strip()
     if not title or title.endswith("的动态"):
         excerpt = re.sub(r"\s+", " ", text).strip()
-        title = excerpt[:50] + ("..." if len(excerpt) > 50 else "")
+        if excerpt:
+            title = excerpt[:50] + ("..." if len(excerpt) > 50 else "")
+        elif video_title:
+            title = str(video_title).strip()
     return title or "发布了一条动态"
 
 
