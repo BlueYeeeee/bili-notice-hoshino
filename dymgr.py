@@ -118,15 +118,36 @@ def get_web_dynamic_content(card: dict):
         if isinstance(pic_info, dict):
             image_items.extend(pic_info.get("pics") or [])
 
-    # 兼容空间动态列表接口返回的简化结构。
+    # 新版详情接口使用 MODULE_TYPE_CONTENT，并把文本/图片拆在段落中。
+    # 列表接口则通常把正文放在 module_dynamic.desc 中。
     dynamic = get_web_module(card, "module_dynamic")
-    major = dynamic.get("major") or {} if isinstance(dynamic, dict) else {}
-    draw_info = major.get("draw") or {}
-    opus_info = major.get("opus") or {}
-    if isinstance(draw_info, dict):
-        image_items.extend(draw_info.get("items") or [])
-    if isinstance(opus_info, dict):
-        image_items.extend(opus_info.get("pics") or [])
+    if isinstance(dynamic, dict):
+        desc = dynamic.get("desc") or {}
+        if isinstance(desc, dict):
+            desc_text = desc.get("text") or ""
+            if isinstance(desc_text, list):
+                desc_text = rich_text_nodes_to_text(desc_text)
+            if desc_text and not text_parts:
+                text_parts.append(str(desc_text))
+            if not text_parts:
+                rich_text = rich_text_nodes_to_text(desc.get("rich_text_nodes"))
+                if rich_text:
+                    text_parts.append(rich_text)
+
+        major = dynamic.get("major") or {}
+        draw_info = major.get("draw") or {} if isinstance(major, dict) else {}
+        opus_info = major.get("opus") or {} if isinstance(major, dict) else {}
+        if isinstance(draw_info, dict):
+            image_items.extend(draw_info.get("items") or [])
+        if isinstance(opus_info, dict):
+            image_items.extend(opus_info.get("pics") or [])
+
+    # 详情接口的 title 可能只有 basic.title，正文仍然来自 paragraphs。
+    if not text_parts:
+        basic = card.get("basic") or {}
+        summary = basic.get("summary") or basic.get("description") or ""
+        if summary:
+            text_parts.append(str(summary))
 
     return "\n".join(text_parts).strip(), image_items
 
@@ -134,11 +155,16 @@ def get_web_dynamic_content(card: dict):
 def get_web_dynamic_title(card: dict, nick: str):
     title_info = get_web_module(card, "module_title")
     title = title_info.get("text", "") if isinstance(title_info, dict) else ""
+    basic = card.get("basic") or {}
+    if not title and isinstance(basic, dict):
+        title = basic.get("title", "")
+    title = re.sub(r"\s*-\s*哔哩哔哩(?:\s*-\s*Bilibili)?$", "", str(title or "").strip(), flags=re.IGNORECASE)
+
     text, _ = get_web_dynamic_content(card)
     title = str(title or "").strip()
     default_title = f"{nick}的动态"
-    if not title or title == default_title:
-        excerpt = re.sub(r"\\s+", " ", text).strip()
+    if not title or title == default_title or title.endswith("的动态") and title[:-3] == nick:
+        excerpt = re.sub(r"\s+", " ", text).strip()
         title = excerpt[:50] + ("..." if len(excerpt) > 50 else "")
     return title or "发布了一条动态"
 
@@ -149,7 +175,10 @@ async def draw_web_dynamic_card(card: dict, this_up: dict):
     major = dynamic.get("major") or {} if isinstance(dynamic, dict) else {}
     major_type = major.get("type", "") if isinstance(major, dict) else ""
     card_type = card.get("type", "")
-    if card_type not in ["", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_FORWARD", "DYNAMIC_TYPE_WORD"] and major_type not in ["MAJOR_TYPE_DRAW", "MAJOR_TYPE_OPUS"]:
+
+    # 新版 detail 的 item 可能没有字符串类型字段，只要有正文或图片就尝试渲染。
+    text, items = get_web_dynamic_content(card)
+    if not text and not items:
         return None, ""
 
     box = drawCard.Box(conf)
@@ -160,7 +189,6 @@ async def draw_web_dynamic_card(card: dict, this_up: dict):
     pub_time, _ = get_card_pub_time(card)
     nickimg = box.nickname(nick=nick, time=time.strftime("%y-%m-%d %H:%M", time.localtime(pub_time)))
 
-    text, items = get_web_dynamic_content(card)
     title = get_web_dynamic_title(card, nick)
     pics = []
     seen_urls = set()
@@ -733,6 +761,18 @@ async def get_update():
 async def follow(uid, group): # sync to async
     global number,up_latest, up_list, gcookies
     retry_time=3
+
+    # 手动关注命令可能早于定时轮询执行，先确保拿到登录cookie和WBI密钥。
+    if not gcookies or not gcookies.get("SESSDATA"):
+        gcookies = await auth.update_cookies(1)
+    if not gcookies or not gcookies.get("SESSDATA"):
+        log.warning('关注前未获取到有效的B站登录cookie，停止联网核查。')
+        if allow_follow_illegal:
+            log.warning('allow_follow_illegal=true，但本次不自动记录UID，避免把核查失败误认为关注成功。')
+        return False, '未获取到有效的B站登录cookie，请检查 res/bili_cookie.txt。'
+    if not wbi.check():
+        await wbi.update()
+
     """关注UP主,并创建和修改对应的记录文件
 
     Args:
