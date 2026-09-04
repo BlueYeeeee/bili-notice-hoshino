@@ -75,17 +75,54 @@ def image_to_base64(img):
 
 
 def rich_text_nodes_to_text(nodes):
-    if not isinstance(nodes, list):
+    if isinstance(nodes, str):
+        return nodes
+    if isinstance(nodes, list):
+        return "".join(rich_text_nodes_to_text(node) for node in nodes)
+    if not isinstance(nodes, dict):
         return ""
-    parts = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        word = node.get("word") or {}
-        rich = node.get("rich") or {}
-        value = word.get("words") or rich.get("text") or node.get("text") or ""
-        parts.append(str(value))
-    return "".join(parts)
+
+    word = nodes.get("word")
+    if isinstance(word, str):
+        return word
+    if isinstance(word, dict):
+        value = word.get("words") or word.get("text") or word.get("content")
+        if value:
+            return str(value)
+    rich = nodes.get("rich")
+    if isinstance(rich, dict):
+        value = rich.get("text") or rich.get("orig_text")
+        if value:
+            return str(value)
+
+    # 兼容新版接口将节点包在 text/content/nodes 下的情况。
+    for key in ("text", "words", "content", "orig_text", "nodes"):
+        value = nodes.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            text = rich_text_nodes_to_text(value)
+            if text:
+                return text
+    return ""
+
+
+def extract_paragraph_text(paragraph):
+    if not isinstance(paragraph, dict):
+        return ""
+    for key in ("text", "heading", "blockquote", "list", "code", "line"):
+        text = rich_text_nodes_to_text(paragraph.get(key))
+        if text:
+            return text
+    return ""
+
+
+def extract_content_text(content):
+    if not isinstance(content, dict):
+        return ""
+    paragraphs = content.get("paragraphs") or []
+    parts = [extract_paragraph_text(p) for p in paragraphs]
+    return "\n".join(text for text in parts if text).strip()
 
 
 def get_web_module(card: dict, key: str):
@@ -110,8 +147,7 @@ def get_web_dynamic_content(card: dict):
     for paragraph in paragraphs:
         if not isinstance(paragraph, dict):
             continue
-        text_info = paragraph.get("text") or {}
-        text = rich_text_nodes_to_text(text_info.get("nodes", [])) if isinstance(text_info, dict) else ""
+        text = extract_paragraph_text(paragraph)
         if text:
             text_parts.append(text)
         pic_info = paragraph.get("pic") or {}
@@ -162,8 +198,7 @@ def get_web_dynamic_title(card: dict, nick: str):
 
     text, _ = get_web_dynamic_content(card)
     title = str(title or "").strip()
-    default_title = f"{nick}的动态"
-    if not title or title == default_title or title.endswith("的动态") and title[:-3] == nick:
+    if not title or title.endswith("的动态"):
         excerpt = re.sub(r"\s+", " ", text).strip()
         title = excerpt[:50] + ("..." if len(excerpt) > 50 else "")
     return title or "发布了一条动态"
@@ -190,6 +225,7 @@ async def draw_web_dynamic_card(card: dict, this_up: dict):
     nickimg = box.nickname(nick=nick, time=time.strftime("%y-%m-%d %H:%M", time.localtime(pub_time)))
 
     title = get_web_dynamic_title(card, nick)
+    log.debug(f'新版动态文字提取：id={card.get("id_str")}, title={title[:100]!r}, text={text[:160]!r}, source_type={card.get("type")}')
     pics = []
     seen_urls = set()
     for item in items:
